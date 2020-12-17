@@ -2,6 +2,7 @@ package messagepool
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,12 +15,14 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	tbig "github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 	logging "github.com/ipfs/go-log"
 
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 
+	"github.com/filecoin-project/venus/pkg/config"
 	"github.com/filecoin-project/venus/pkg/constants"
 	"github.com/filecoin-project/venus/pkg/messagepool/gasguess"
 	"github.com/filecoin-project/venus/pkg/repo"
@@ -45,28 +48,28 @@ func makeTestMessage(w *wallet.Wallet, from, to address.Address, nonce uint64, g
 		Value:      types.FromFil(0),
 		Nonce:      nonce,
 		GasLimit:   types.NewGas(gasLimit),
-		GasFeeCap:  types.NewAttoFILFromFIL(100 + gasPrice),
-		GasPremium: types.NewAttoFILFromFIL(gasPrice),
+		GasFeeCap:  tbig.NewInt(int64(100) + int64(gasPrice)),
+		GasPremium: tbig.NewInt(int64(gasPrice)),
 	}
 
 	c, err := msg.Cid()
 	if err != nil {
 		panic(err)
 	}
-	sig, err := w.SignBytes(c.Bytes(), from)
+	sig, err := w.WalletSign(context.TODO(), from, c.Bytes(), wallet.MsgMeta{})
 	if err != nil {
 		panic(err)
 	}
 	return &types.SignedMessage{
 		Message:   *msg,
-		Signature: sig,
+		Signature: *sig,
 	}
 }
 
 func makeTestMpool() (*MessagePool, *testMpoolAPI) {
 	tma := newTestMpoolAPI()
 	ds := datastore.NewMapDatastore()
-	mp, err := New(tma, ds, "test", nil, nil, nil)
+	mp, err := New(tma, ds, config.DefaultForkUpgradeParam, "test", nil, nil, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -1339,6 +1342,11 @@ func TestGasReward(t *testing.T) {
 	}
 }
 
+type SignedMessage struct {
+	Message   types.UnsignedMessage
+	Signature crypto.Signature
+}
+
 func TestRealWorldSelection(t *testing.T) {
 	// load test-messages.json.gz and rewrite the messages so that
 	// 1) we map each real actor to a test actor so that we can sign the messages
@@ -1360,11 +1368,16 @@ func TestRealWorldSelection(t *testing.T) {
 
 readLoop:
 	for {
-		m := new(types.SignedMessage)
+		m := new(SignedMessage)
 		err := dec.Decode(m)
 		switch err {
 		case nil:
-			msgs = append(msgs, m)
+			sm := types.SignedMessage{
+				Message: m.Message,
+				Signature: m.Signature,
+			}
+			msgs = append(msgs, &sm)
+
 			nonce, ok := baseNonces[m.Message.From]
 			if !ok || m.Message.Nonce < nonce {
 				baseNonces[m.Message.From] = m.Message.Nonce
@@ -1393,7 +1406,7 @@ readLoop:
 			}
 			w := wallet.New(backend)
 
-			a, err := wallet.NewAddress(w, address.BLS)
+			a, err := wallet.NewAddress(w, address.SECP256K1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1412,12 +1425,12 @@ readLoop:
 		m.Message.Nonce -= baseNonce
 
 		c, _ := m.Message.Cid()
-		sig, err := w.SignBytes(c.Bytes(), localActor)
+		sig, err := w.WalletSign(context.TODO(), localActor, c.Bytes(), wallet.MsgMeta{})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		m.Signature = sig
+		m.Signature = *sig
 	}
 
 	mp, tma := makeTestMpool()
